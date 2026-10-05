@@ -1,0 +1,23 @@
+{
+  "name": "flashinfer_wrapper_9sdjf3",
+  "definition": "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048",
+  "author": "flashinfer",
+  "spec": {
+    "language": "python",
+    "target_hardware": [
+      "NVIDIA B200"
+    ],
+    "entry_point": "main.py::run",
+    "dependencies": [
+      "flashinfer"
+    ],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "main.py",
+      "content": "import torch\nfrom flashinfer.fused_moe import trtllm_fp8_block_scale_moe\n\n\nNUM_EXPERTS_GLOBAL = 256\nTOP_K = 8\nN_GROUP = 8\nTOPK_GROUP = 4\nHIDDEN_SIZE = 7168\nINTERMEDIATE_SIZE = 2048\nBLOCK_SIZE = 128\n\n\n@torch.no_grad()\ndef run(\n    routing_logits: torch.Tensor,\n    routing_bias: torch.Tensor,\n    hidden_states: torch.Tensor,\n    hidden_states_scale: torch.Tensor,\n    gemm1_weights: torch.Tensor,\n    gemm1_weights_scale: torch.Tensor,\n    gemm2_weights: torch.Tensor,\n    gemm2_weights_scale: torch.Tensor,\n    local_expert_offset: int,\n    routed_scaling_factor: float,\n):\n    seq_len, num_experts = routing_logits.shape\n    local_num_experts = gemm1_weights.shape[0]\n\n    assert num_experts == NUM_EXPERTS_GLOBAL\n    assert hidden_states.shape == (seq_len, HIDDEN_SIZE)\n    assert hidden_states_scale.shape == (HIDDEN_SIZE // BLOCK_SIZE, seq_len)\n    assert gemm1_weights.shape == (local_num_experts, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE)\n    assert gemm1_weights_scale.shape == (\n        local_num_experts,\n        (2 * INTERMEDIATE_SIZE) // BLOCK_SIZE,\n        HIDDEN_SIZE // BLOCK_SIZE,\n    )\n    assert gemm2_weights.shape == (local_num_experts, HIDDEN_SIZE, INTERMEDIATE_SIZE)\n    assert gemm2_weights_scale.shape == (\n        local_num_experts,\n        HIDDEN_SIZE // BLOCK_SIZE,\n        INTERMEDIATE_SIZE // BLOCK_SIZE,\n    )\n    assert routing_bias is None or routing_bias.shape[-1] == NUM_EXPERTS_GLOBAL\n\n    if isinstance(local_expert_offset, torch.Tensor):\n        local_expert_offset = int(local_expert_offset.item())\n    else:\n        local_expert_offset = int(local_expert_offset)\n\n    if isinstance(routed_scaling_factor, torch.Tensor):\n        routed_scaling_factor = float(routed_scaling_factor.item())\n    else:\n        routed_scaling_factor = float(routed_scaling_factor)\n\n    routing_logits_f32 = routing_logits.to(torch.float32).contiguous()\n    hidden_states_scale_f32 = hidden_states_scale.to(torch.float32).contiguous()\n    gemm1_weights_scale_f32 = gemm1_weights_scale.to(torch.float32).contiguous()\n    gemm2_weights_scale_f32 = gemm2_weights_scale.to(torch.float32).contiguous()\n\n    if routing_bias is not None:\n        routing_bias = routing_bias.contiguous()\n\n    return trtllm_fp8_block_scale_moe(\n        routing_logits_f32,\n        routing_bias,\n        hidden_states.contiguous(),\n        hidden_states_scale_f32,\n        gemm1_weights.contiguous(),\n        gemm1_weights_scale_f32,\n        gemm2_weights.contiguous(),\n        gemm2_weights_scale_f32,\n        NUM_EXPERTS_GLOBAL,\n        TOP_K,\n        N_GROUP,\n        TOPK_GROUP,\n        INTERMEDIATE_SIZE,\n        local_expert_offset,\n        local_num_experts,\n        routed_scaling_factor,\n        routing_method_type=2,\n        use_shuffled_weight=False,\n    )\n"
+    }
+  ],
+  "description": "Solution using flashinfer.fused_moe.trtllm_fp8_block_scale_moe."
+}

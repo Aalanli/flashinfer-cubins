@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+kernel_cache/
+resources/flashinfer-*
+resources/flashinfer.tar.gz
+resources/cutlass-*
+resources/cutlass.tar.gz
+resources/DeepGEMM
+resources/moe-artifacts/
+resources/moe-artifacts-v031/
+resources/trtllm-gen-artifacts/
+test_results*.json
+resources/flashinfer_jit_cache_*.whl
+resources/downloads.json
+# Everything impls/<package>/compiler.py writes (rebuild: ./compile_kernels.py).
+# Cubins with their sidecars and probe fixtures:
+impls/*/cubins/
+# Manifests and build records:
+impls/*/kernels.json
+impls/*/provenance.json
+# Variant indexes, case tables and probe fixtures:
+impls/batched_gemm/variants/
+impls/batched_gemm/fixtures/
+impls/deep_gemm/variants.json
+impls/fmha/variants/
+impls/fmha/fixtures/
+# Kernel source generated from the pinned upstream kernel:
+impls/gdn/kernels/gdn_chunk.cu
+# Partial writes of the compilers' atomic JSON writers (os.replace target).
+impls/**/*.tmp

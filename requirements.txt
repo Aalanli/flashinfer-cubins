@@ -1,0 +1,8 @@
+# Python dependency for the harness, scripts, and unittest suite.
+# Matches the validated ml environment (torch 2.11.0+cu130); the version pin
+# permits CUDA-specific wheel variants. GPU execution needs a CUDA-enabled wheel.
+torch==2.11.0
+
+# Install system tools separately: CUDA toolkit (nvcc/cuobjdump; tested 13.2),
+# a compatible NVIDIA driver, and a host C++ compiler. Fetch scripts also use
+# curl/git. FlashInfer, DeepGEMM, and CUTLASS Python packages are not required.

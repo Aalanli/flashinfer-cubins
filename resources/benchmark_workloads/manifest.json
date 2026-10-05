@@ -1,0 +1,51 @@
+{
+  "moe": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest/resolve/main/workloads/moe/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.jsonl",
+    "revision": "5e832ce88dd1013032b22a0e942979d7d2769cc3",
+    "sha256": "4d983800c693afa74bd4e565da0d9658526166e462cfe8e646f9d2d219e61bd1",
+    "rows": 19,
+    "definition": "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+  },
+  "dsa_indexer": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest/resolve/main/workloads/dsa_paged/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64.jsonl",
+    "revision": "5e832ce88dd1013032b22a0e942979d7d2769cc3",
+    "sha256": "3f9058d0157ebe8607f1fb09f8e8f21ed636faae42ed6abb7f03b9183d847810",
+    "rows": 128,
+    "definition": "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+  },
+  "dsa_attention": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest/resolve/main/workloads/dsa_paged/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64.jsonl",
+    "revision": "5e832ce88dd1013032b22a0e942979d7d2769cc3",
+    "sha256": "bafbecdc3405e53d5a404a7daca2dd2b5162d56028ee354c7cb24f2526790046",
+    "rows": 23,
+    "definition": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+  },
+  "gdn_decode": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest/resolve/main/workloads/gdn/gdn_decode_qk4_v8_d128_k_last.jsonl",
+    "revision": "5e832ce88dd1013032b22a0e942979d7d2769cc3",
+    "sha256": "ea38b77d09e57098a99391fac422fe9d9695c407b171a3bcfba72858e3468ce9",
+    "rows": 54,
+    "definition": "gdn_decode_qk4_v8_d128_k_last"
+  },
+  "gdn_prefill": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest/resolve/main/workloads/gdn/gdn_prefill_qk4_v8_d128_k_last.jsonl",
+    "revision": "5e832ce88dd1013032b22a0e942979d7d2769cc3",
+    "sha256": "279eea77da0aa1cd47ad953e790e0a0f062ed5c7578c4a55eccee105b6d1151e",
+    "rows": 100,
+    "definition": "gdn_prefill_qk4_v8_d128_k_last"
+  },
+  "gqa_decode": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace/resolve/main/workloads/gqa_paged/gqa_paged_decode_h32_kv4_d128_ps1.jsonl",
+    "revision": "da915083d4c7c5e61aa3005e3d17ae488e0fc71c",
+    "sha256": "1cbd8dfd95e001832b3dfed670df190e39e7a0e46f6a7072b3d057b3c3014811",
+    "rows": 48,
+    "definition": "gqa_paged_decode_h32_kv4_d128_ps1"
+  },
+  "rmsnorm": {
+    "url": "https://huggingface.co/datasets/flashinfer-ai/flashinfer-trace/resolve/main/workloads/rmsnorm/rmsnorm_h7168.jsonl",
+    "revision": "da915083d4c7c5e61aa3005e3d17ae488e0fc71c",
+    "sha256": "3a0b33bb6307888e622702aed7e5160aa067261a8da85b09f0a59661c0d5ecfb",
+    "rows": 8,
+    "definition": "rmsnorm_h7168"
+  }
+}

@@ -1,0 +1,24 @@
+{
+    "name": "flashinfer_deepgemm_wrapper_2ba145",
+    "definition": "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64",
+    "author": "flashinfer, deep_gemm",
+    "spec": {
+      "language": "python",
+      "target_hardware": [
+        "NVIDIA B200"
+      ],
+      "entry_point": "main.py::run",
+      "dependencies": [
+        "flashinfer-python",
+        "deep_gemm"
+      ],
+      "destination_passing_style": false
+    },
+    "description": "Solution using deep_gemm FP8 paged MQA logits and FlashInfer top-k page table transform for DSA top-k indexer (fp8, h64, d128, topk2048, page_size=64).",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "import torch\nimport deep_gemm\nimport flashinfer\n\n\n@torch.no_grad()\ndef run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):\n    \"\"\"\n    DeepSeek sparse attention top-K indexer using deep_gemm FP8 kernel + FlashInfer.\n    \n    Pipeline: deep_gemm.fp8_paged_mqa_logits -> flashinfer.top_k_page_table_transform\n    \"\"\"\n    batch_size, num_index_heads, index_head_dim = q_index_fp8.shape\n    num_pages, page_size, _, _ = k_index_cache_fp8.shape\n    topk = 2048\n\n    # Check constants\n    assert num_index_heads == 64\n    assert index_head_dim == 128\n    assert page_size == 64\n\n    device = q_index_fp8.device\n    max_num_pages = block_table.shape[1]\n    max_context_len = max_num_pages * page_size\n\n    # deep_gemm expects q shape: [batch, next_n, heads, head_dim]\n    q_index_fp8_4d = q_index_fp8.unsqueeze(1)  # [batch, 1, heads, head_dim]\n    k_index_cache_uint8 = k_index_cache_fp8.view(torch.uint8)\n\n    # Get schedule metadata for deep_gemm\n    num_sms = torch.cuda.get_device_properties(device).multi_processor_count\n    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(seq_lens, page_size, num_sms)\n\n    # Compute FP8 attention scores using deep_gemm\n    logits = deep_gemm.fp8_paged_mqa_logits(\n        q_index_fp8_4d,\n        k_index_cache_uint8,\n        weights,\n        seq_lens,\n        block_table,\n        schedule_meta,\n        max_context_len,\n        clean_logits=False,\n    )\n\n    # Build token-level page table for FlashInfer\n    offsets = torch.arange(page_size, device=device, dtype=torch.int32)\n    physical = block_table.unsqueeze(-1) * page_size + offsets  # [batch, max_num_pages, page_size]\n    physical_flat = physical.reshape(batch_size, -1)  # [batch, max_num_pages * page_size]\n    token_indices = torch.arange(max_num_pages * page_size, device=device)\n    mask = token_indices.unsqueeze(0) < seq_lens.unsqueeze(1)\n    token_page_table = torch.where(mask, physical_flat, torch.zeros_like(physical_flat))\n\n    # Run FlashInfer top-k selection\n    topk_indices = flashinfer.top_k_page_table_transform(\n        input=logits.to(torch.float16), \n        src_page_table=token_page_table, \n        lengths=seq_lens, \n        k=topk\n    )\n\n    return (topk_indices,)\n"
+      }
+    ]
+  }
