@@ -95,6 +95,30 @@ other rows no candidate selects        dead on sm_100 for every probed shape
 ``sTllmGenFmhaKernelMetaInfosVx``      dead: Sage / int8-QK kernels of a table
 (44 cubins)                              no FlashInfer v0.6.9 code loads
 =====================================  =========================================
+
+Case restrictions (shape-dependent defects, measured on B200 with upstream's
+KernelParams and reproduced with FlashInfer v0.6.9's
+``trtllm_batch_decode_with_kv_cache``; the kernels compute every other shape
+correctly, so they stay live and ``case_restriction`` keeps their cases out
+of these shapes; ``provenance.json`` ``case_restrictions`` counts the dropped
+candidates):
+
+=====================================  =========================================
+kernels                                restriction / defect
+=====================================  =========================================
+generation, Q dtype != KV dtype        numHeadsQPerKv <= stepQ: above it only
+                                         the first tile of query heads (grid
+                                         y = 0) is right
+SlidingOrChunkedCausal generation,     query token i takes its KV tile range
+one query token per CTA                  from kv - 1 - 2 (q-1-i) instead of
+(groupsTokensHeadsQ false)               kv - 1 - (q-1-i): it loses its last
+                                         tile (or its whole row) or, at the
+                                         window start, also reads the previous
+                                         tile unmasked; cases keep both in the
+                                         same tile at both ends
+FP16/BF16 Q, E4M3 KV, head dim 64      NHD caches only with one KV head: NHD
+                                         with more KV heads gives wrong output
+=====================================  =========================================
 """
 
 from __future__ import annotations
@@ -528,12 +552,12 @@ def _log_lengths(
 
 def materialize(
     t: Any, m: dict[str, Any], skel: dict[str, Any], seed: int, serving: bool = False
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """A generation skeleton with ragged lengths (same maxima, so the same
     kernel is selected): skewed KV lengths with a minimal request, variable
     query lengths when the case passes cumulative query lengths. ``serving``
     (throughput) keeps the KV lengths within [max / 4, max], no minimal
-    request."""
+    request. None: no such lengths within the kernel's case restrictions."""
     rng = random.Random(seed)
     case = json.loads(json.dumps(skel))
     batch = len(case["q_lens"])
@@ -547,8 +571,18 @@ def materialize(
     if case.get("topk"):
         lo = max(lo, min(case["topk"], max_kv))
     kv = _log_lengths(rng, batch, lo, max_kv, minimal=not serving)
+    kv = [max(k, q) for k, q in zip(kv, q_lens)]
+    if sliding_tiles_restricted(t, m):
+        fitted, kv = fit_last_tiles(m, q_lens, kv, max_kv, case["window_left"])
+        # Without cumulative query lengths every request has max_q tokens.
+        ragged_ok = bool(case.get("cum_q"))
+        if max(kv) != max_kv or (fitted != q_lens and not ragged_ok):
+            return None
+        if max(fitted) != max_q:
+            return None
+        q_lens = fitted
     case["q_lens"] = q_lens
-    case["kv_lens"] = [max(k, q) for k, q in zip(kv, q_lens)]
+    case["kv_lens"] = kv
     for key in ("num_pages", "max_pages"):
         case.pop(key, None)
     return finish_case(t, m, case)
@@ -703,7 +737,8 @@ def apply_profile(
         case["device_scales"] = True
         case["bmm2_scale"] = 0.8
         if paged and not mla and not fp4_kv:
-            case["kv_layout"] = "NHD"
+            if not nhd_restricted(m) or case["hkv"] == 1:
+                case["kv_layout"] = "NHD"
         if paged and not m["sparse"]:
             case["shared_idx"] = False
         if paged and not mla:
@@ -994,6 +1029,96 @@ def defect(t: Any, m: dict[str, Any]) -> str | None:
     if m["dtkv"] == "e2m1" and m["hdV"] == 64 and m["tpp"] == 16:
         return DEFECT_FP4KV_H64_P16
     return None
+
+
+# Shape-dependent defects of kernels that compute every other shape correctly
+# (measured on a B200 with KernelParams identical to upstream's, and
+# reproduced with FlashInfer v0.6.9's own trtllm_batch_decode_with_kv_cache):
+# their cases are restricted to the shapes they serve correctly instead of
+# excluding the kernels. FlashInfer's tests use none of these shapes.
+RESTRICT_MIXED_HEADS = (
+    "restricted (defect): generation kernels with Q dtype != KV dtype compute only "
+    "the first tile of query heads (grid y = 0) correctly when numHeadsQPerKv > "
+    "stepQ; cases keep numHeadsQPerKv <= stepQ"
+)
+RESTRICT_SLIDING_TILES = (
+    "restricted (defect): SlidingOrChunkedCausal generation kernels with one query "
+    "token per CTA (groupsTokensHeadsQ false) take the KV tile range of query token "
+    "i of q from position kv - 1 - 2 (q-1-i) instead of kv - 1 - (q-1-i): where that "
+    "falls in an earlier tile, the token loses its last KV tile (or, none left, is "
+    "not written) or, at the sliding-window start, also processes the preceding tile "
+    "without the window mask; cases keep both positions in the same tile, at the end "
+    "and at the window start, for every query token of every request"
+)
+RESTRICT_NHD_H64 = (
+    "restricted (defect): FP16/BF16 Q with E4M3 KV, head dim 64: NHD caches with "
+    "more than one KV head give wrong output; NHD cases keep one KV head"
+)
+
+
+def sliding_tiles_restricted(t: Any, m: dict[str, Any]) -> bool:
+    return (
+        m["ktype"] != t.CONTEXT
+        and m["mask"] == t.SLIDING
+        and not m["groupsTokensHeadsQ"]
+    )
+
+
+def tile_offset_defect(m: dict[str, Any], q: int, kv: int, window: int) -> bool:
+    """A query token of a (q, kv) request whose KV tile range
+    RESTRICT_SLIDING_TILES changes: its last position, or its window start
+    (window >= 0 and in use), lies in another tile than the kernel's."""
+    tile = m["tileKv"]
+    for d in range(1, q):
+        if (kv - 1 - d) // tile != (kv - 1 - 2 * d) // tile or kv - 1 - 2 * d < 0:
+            return True
+        start = kv - 1 - d - window
+        if window >= 0 and start > 0 and max(0, start - d) // tile != start // tile:
+            return True
+    return False
+
+
+def nhd_restricted(m: dict[str, Any]) -> bool:
+    return m["dtq"] in ("fp16", "bf16") and m["dtkv"] == "e4m3" and m["hdQk"] == 64
+
+
+def case_restriction(t: Any, m: dict[str, Any], case: dict[str, Any]) -> str | None:
+    """The restriction ``case`` violates (None: the kernel serves it)."""
+    if (
+        m["ktype"] != t.CONTEXT
+        and m["dtq"] != m["dtkv"]
+        and case["hq"] // case["hkv"] > m["stepQ"]
+    ):
+        return RESTRICT_MIXED_HEADS
+    if sliding_tiles_restricted(t, m) and any(
+        tile_offset_defect(m, q, kv, case["window_left"])
+        for q, kv in zip(case["q_lens"], case["kv_lens"])
+    ):
+        return RESTRICT_SLIDING_TILES
+    if nhd_restricted(m) and case.get("kv_layout") == "NHD" and case["hkv"] > 1:
+        return RESTRICT_NHD_H64
+    return None
+
+
+def fit_last_tiles(
+    m: dict[str, Any],
+    q_lens: list[int],
+    kv_lens: list[int],
+    max_kv: int,
+    window: int,
+) -> tuple[list[int], list[int]]:
+    """Ragged lengths within RESTRICT_SLIDING_TILES: each request's KV length
+    grows to the next admissible one up to ``max_kv``, else its query length
+    shrinks (callers check that the maxima, which selection reads, hold)."""
+    q_out, kv_out = [], []
+    for q, kv in zip(q_lens, kv_lens):
+        while tile_offset_defect(m, q, kv, window) and kv < max_kv:
+            kv += 1
+        while tile_offset_defect(m, q, kv, window):
+            q -= 1
+        q_out.append(q)
+        kv_out.append(kv)
+    return q_out, kv_out
 
 
 def exclusion(t: Any, m: dict[str, Any], twins: set[str]) -> str | None:
@@ -1429,6 +1554,18 @@ def _build_cases(
                 if f in upstream.FLAG_KEYS and f != "sf_start":
                     flags_needed[kernel][f].add(v)
 
+    # Candidates dropped by the case restrictions: reason -> kernel -> count.
+    dropped: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    def admissible(m: dict[str, Any], case: dict[str, Any] | None) -> bool:
+        # materialize returns None only for RESTRICT_SLIDING_TILES.
+        reason = (
+            RESTRICT_SLIDING_TILES if case is None else case_restriction(t, m, case)
+        )
+        if reason is not None:
+            dropped[reason][m["name"]] += 1
+        return reason is None
+
     goal_stats = {"achievable": defaultdict(int), "covered": defaultdict(int)}
     for members in groups.values():
         for m in members:
@@ -1440,17 +1577,22 @@ def _build_cases(
                 picks = context_designs(t, m)
                 achievable = set().union(*(goals(t, m, c) for c in picks))
             else:
-                pool = [
+                sweep = [
                     materialize(t, m, cases1[i], rng_seed + i) for i in selected[name]
                 ]
+                pool = [c for c in sweep if admissible(m, c)]
                 if not pool:
-                    # Selected only by model or upstream shapes.
-                    pool = [
+                    # Selected only by model or upstream shapes (or no sweep
+                    # shape is admissible).
+                    other = [
                         materialize(t, m, cases1[i], rng_seed + i)
                         for i in model_sel.get(name, [])
                     ] + [dict(e["case"]) for e in upstream_by_kernel.get(name, [])]
+                    if not sweep and not other:
+                        continue
+                    pool = [c for c in other if admissible(m, c)]
                 if not pool:
-                    continue
+                    raise AssertionError(f"{name}: no selecting shape is admissible")
                 cands = []
                 for i, case in enumerate(pool):
                     flops, nbytes = case_cost(t, m, case)
@@ -1550,6 +1692,8 @@ def _build_cases(
                 case = cases1[i]
                 if m["ktype"] != t.CONTEXT:
                     case = materialize(t, m, case, rng_seed + i, serving=True)
+                if not admissible(m, case):
+                    continue
                 if source.get("inventory") == "dsa_attention":
                     # The recorded page pool and token count (one query
                     # token per request).
@@ -1584,6 +1728,8 @@ def _build_cases(
                 stress = []
                 for i in selected.get(name, []):
                     case = materialize(t, m, cases1[i], rng_seed + 7 * i, serving=True)
+                    if not admissible(m, case):
+                        continue
                     flops, nbytes = case_cost(t, m, case)
                     if flops <= THROUGHPUT_FLOPS and nbytes <= THROUGHPUT_BYTES:
                         stress.append((nbytes + flops / 1e3, i, case, None))
@@ -1620,6 +1766,17 @@ def _build_cases(
                 case.update(suite="throughput", label="trtllm_packed")
                 cases.append(case)
             for case in cases:
+                reason = case_restriction(t, m, case)
+                if reason is not None:
+                    raise AssertionError(f"{name} {case['label']}: {reason}")
+                if (
+                    m["ktype"] != t.CONTEXT
+                    and len(set(case["q_lens"])) > 1
+                    and not case.get("cum_q")
+                ):
+                    raise AssertionError(
+                        f"{name} {case['label']}: ragged query lengths need cum_q"
+                    )
                 case["flashinfer"] = flashinfer_runner(t, m, case)
                 final.append((name, case))
 
@@ -1706,6 +1863,13 @@ def _build_cases(
         "candidates": len(lines),
         "cases": dict(sorted(counts.items())),
         "throughput_cases_below_148_ctas": small_grid,
+        "case_restrictions": {
+            reason: {
+                "kernels": len(per_kernel),
+                "candidates_dropped": sum(per_kernel.values()),
+            }
+            for reason, per_kernel in sorted(dropped.items())
+        },
         "smoke_goals": {
             g: [goal_stats["covered"][g], goal_stats["achievable"][g]] for g in GOALS
         },

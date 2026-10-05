@@ -15,13 +15,15 @@ Only trusted cubins should be loaded: they are executable code.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import functools
 import json
 import re
 import struct
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -230,8 +232,36 @@ def ctypes_value(value: Any) -> Any:
     )
 
 
+@contextlib.contextmanager
+def exact_fp32() -> Iterator[None]:
+    """FP32 matmuls and convolutions without TF32, whatever the process
+    enables (e.g. ``TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`` in NGC containers);
+    restores the previous flags."""
+    matmul, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    saved = matmul.allow_tf32, cudnn.allow_tf32
+    matmul.allow_tf32 = cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        matmul.allow_tf32, cudnn.allow_tf32 = saved
+
+
+def _exact_fp32_method(method: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(method)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with exact_fp32():
+            return method(*args, **kwargs)
+
+    return wrapper
+
+
 class Workload(ABC):
     """One kernel in one cubin. Subclasses register with ``@register``.
+
+    ``get_inputs`` and ``get_reference`` always run under ``exact_fp32``: a
+    TF32 reference is far less accurate than the kernels it checks (e.g.
+    FP8 products accumulated in FP32), and inputs computed with torch
+    versions of earlier stages must not depend on process-wide settings.
 
     ``name`` and ``supported_arches`` are set by the registry decorator.
     ``package`` names the ``impls/`` directory whose ``kernels.json`` holds the
@@ -241,6 +271,15 @@ class Workload(ABC):
     name: ClassVar[str]
     supported_arches: ClassVar[tuple[str, ...]] = ()
     package: ClassVar[str | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for attr in ("get_inputs", "get_reference"):
+            method = cls.__dict__.get(attr)
+            if method is not None and not getattr(
+                method, "__isabstractmethod__", False
+            ):
+                setattr(cls, attr, _exact_fp32_method(method))
 
     def __init__(
         self,

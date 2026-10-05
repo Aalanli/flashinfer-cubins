@@ -915,6 +915,20 @@ def recover_swizzled_scales(
     return tmp.reshape(full_m, rounded_n).float()[start : start + m, :scale_n]
 
 
+# Relative rounding error of E4M3 (3 mantissa bits, round to nearest).
+E4M3_REL_ROUNDING = 2.0**-4
+
+
+def p_rounding_bound(abs_v: torch.Tensor) -> torch.Tensor:
+    """Per-element error bound from the E4M3 rounding of the softmax
+    probabilities that FP8-query kernels apply before P V: each weight p_k
+    moves by at most 2^-4 p_k, so o_d moves by at most 2^-4 sum_k p_k |v_kd|
+    (``abs_v``, scaled like the output). Measured on B200: at the elements
+    beyond the flat tolerance, the kernels match a reference with P rounded to
+    E4M3 (pre-scaled by 448, normalized by the exact sum) within 1e-4."""
+    return E4M3_REL_ROUNDING * abs_v
+
+
 def e4m3_ulp(magnitude: torch.Tensor) -> torch.Tensor:
     """Spacing of the E4M3 grid at ``magnitude`` (3 mantissa bits; below the
     smallest normal 2^-6 the subnormal spacing 2^-9)."""
@@ -986,8 +1000,10 @@ def attention(
     window_left: int,
     sinks: torch.Tensor | None = None,
     allowed: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One request: q [Lq, Hq, D], k/v [Lk, Hkv, D] (float32) -> (o, lse2).
+    with_abs_v: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """One request: q [Lq, Hq, D], k/v [Lk, Hkv, D] (float32) -> (o, lse2),
+    plus ``P |V|`` (the softmax weights applied to |V|) for ``with_abs_v``.
 
     Queries are the last Lq of the Lk positions (bottom-right causal, as
     FlashInfer); ``window_left`` keeps keys j >= pos - window_left;
@@ -1004,7 +1020,7 @@ def attention(
     qg = q.reshape(lq, hkv, group, d)
     step = max(1, REF_CHUNK // max(1, hq * lk))
     key = torch.arange(lk, device=q.device).unsqueeze(0)
-    outs, lses = [], []
+    outs, lses, abs_outs = [], [], []
     for start in range(0, lq, step):
         stop = min(lq, start + step)
         logits = torch.einsum("qhgd,khd->hgqk", qg[start:stop], k) * scale
@@ -1026,7 +1042,15 @@ def attention(
         out = torch.einsum("hgqk,khd->qhgd", probs, v).reshape(stop - start, hq, dv)
         outs.append(out)
         lses.append((lse * LOG2E).reshape(hq, stop - start).transpose(0, 1))
+        if with_abs_v:
+            abs_outs.append(
+                torch.einsum("hgqk,khd->qhgd", probs, v.abs()).reshape(
+                    stop - start, hq, dv
+                )
+            )
         del logits, probs
+    if with_abs_v:
+        return torch.cat(outs), torch.cat(lses), torch.cat(abs_outs)
     return torch.cat(outs), torch.cat(lses)
 
 
@@ -1447,7 +1471,8 @@ class TrtllmFmha(Workload):
     def get_reference(self, inputs: tuple) -> tuple:
         """``(o as stored, o scale factors or None, multi-CTA KV counters (the
         kernels leave them zeroed), base-2 LSE or None (ragged kernels), o in
-        float32 before output quantization)``."""
+        float32 before output quantization, P |V| scaled like o or None (FP8
+        queries, for p_rounding_bound))``."""
         p, t = inputs
         m = self.meta
         hq = p["hq"]
@@ -1464,14 +1489,18 @@ class TrtllmFmha(Workload):
         device = q_all.device
         out = torch.empty((sum_q, hq, dv), dtype=torch.float32, device=device)
         lse_all = torch.empty((sum_q, hq), dtype=torch.float32, device=device)
+        # FP8 queries: the kernel rounds P to E4M3 (see p_rounding_bound).
+        abs_v = None
+        if m["dtq"] == "e4m3":
+            abs_v = torch.empty_like(out)
         start = 0
         for b, (lq, lk) in enumerate(zip(q_lens, kv_lens)):
             q = q_all[start : start + lq].float()
             if p.get("topk", 0) > 0:
-                o, lse = self._sparse_request(p, t, b, q)
+                res = self._sparse_request(p, t, b, q, with_abs_v=abs_v is not None)
             else:
                 k, v = self._request_kv(p, t, b)
-                o, lse = attention(
+                res = attention(
                     q,
                     k,
                     v,
@@ -1479,12 +1508,17 @@ class TrtllmFmha(Workload):
                     causal=causal,
                     window_left=p["window_left"],
                     sinks=sinks,
+                    with_abs_v=abs_v is not None,
                 )
                 del k, v
-            out[start : start + lq] = o
-            lse_all[start : start + lq] = lse
+            out[start : start + lq] = res[0]
+            lse_all[start : start + lq] = res[1]
+            if abs_v is not None:
+                abs_v[start : start + lq] = res[2]
             start += lq
         out *= p["bmm2_scale"]
+        if abs_v is not None:
+            abs_v *= abs(p["bmm2_scale"])
         counter = torch.zeros(counter_size(m, p), dtype=torch.int32, device=device)
         # Ragged kernels write softmax stats; with sinks the kernel's stats
         # convention (sink in the sum or not) is unspecified: not compared.
@@ -1494,15 +1528,20 @@ class TrtllmFmha(Workload):
             o = pack_e2m1(values).reshape(sum_q, hq, dv // 2)
             rows, cols = nvfp4_scale_shape(p, hq, dv)
             o_sf = swizzle_scales(scales, rows, cols, p.get("sf_start", 0))
-            return (o, o_sf, counter, lse_ref, out)
+            return (o, o_sf, counter, lse_ref, out, abs_v)
         if m["dto"] == "e4m3":
             fp8 = out.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-            return (fp8.view(torch.uint8), None, counter, lse_ref, out)
-        return (out.to(TORCH_DTYPE[m["dto"]]), None, counter, lse_ref, out)
+            return (fp8.view(torch.uint8), None, counter, lse_ref, out, abs_v)
+        return (out.to(TORCH_DTYPE[m["dto"]]), None, counter, lse_ref, out, abs_v)
 
     def _sparse_request(
-        self, p: dict[str, Any], t: dict[str, Any], b: int, q: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        p: dict[str, Any],
+        t: dict[str, Any],
+        b: int,
+        q: torch.Tensor,
+        with_abs_v: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Sparse MLA: each query row attends to its top-k token slots."""
         m = self.meta
         dqk, dv = m["hdQk"], m["hdV"]
@@ -1513,18 +1552,20 @@ class TrtllmFmha(Workload):
         rows = []
         for i in range(q.shape[0]):
             k = flat[slots[i].clamp(min=0)].float().unsqueeze(1)  # [topk, 1, D]
-            o, lse = attention(
-                q[i : i + 1],
-                k[..., :dqk],
-                k[..., :dv],
-                p["bmm1_scale"],
-                causal=False,
-                window_left=-1,
-                sinks=t.get("sinks"),
-                allowed=allowed[i : i + 1],
+            rows.append(
+                attention(
+                    q[i : i + 1],
+                    k[..., :dqk],
+                    k[..., :dv],
+                    p["bmm1_scale"],
+                    causal=False,
+                    window_left=-1,
+                    sinks=t.get("sinks"),
+                    allowed=allowed[i : i + 1],
+                    with_abs_v=with_abs_v,
+                )
             )
-            rows.append((o, lse))
-        return torch.cat([o for o, _ in rows]), torch.cat([s for _, s in rows])
+        return tuple(torch.cat(parts) for parts in zip(*rows))
 
     # -- native launch -------------------------------------------------------
 
@@ -1617,7 +1658,7 @@ class TrtllmFmha(Workload):
         # buildLaunchConfig: cluster dims, SPREAD scheduling for clusters > 1,
         # PDL (enable_pdl on sm_100).
         policy = CLUSTER_POLICY_SPREAD if cluster[0] > 1 else CLUSTER_POLICY_DEFAULT
-        outputs = (o, o_sf, counter, stats)
+        outputs = (o, o_sf, counter, stats, None)
 
         def launch_once() -> tuple:
             self.launch(
@@ -1634,15 +1675,12 @@ class TrtllmFmha(Workload):
         return launch_once, outputs
 
     def run(self, inputs: tuple) -> tuple:
-        """``(o, o scale factors or None, counters, base-2 LSE or None, None)``;
-        the LSE is derived from the softmax stats (max, sum) the ragged
-        kernels write, as upstream's ComputeLSEFromMD does after the launch."""
+        """``(o, o scale factors or None, counters, softmax stats (max, sum)
+        or None, None)``, the prepared outputs; ``validate`` derives the
+        base-2 LSE from the stats the ragged kernels write, as upstream's
+        ComputeLSEFromMD does after the launch."""
         launch_once, _ = self.prepare(inputs)
-        o, o_sf, counter, stats = launch_once()
-        lse = None
-        if stats is not None and not inputs[0].get("sinks"):
-            lse = LOG2E * stats[..., 0] + torch.log2(stats[..., 1])
-        return (o, o_sf, counter, lse, None)
+        return launch_once()
 
     # -- validation -----------------------------------------------------------
 
@@ -1650,8 +1688,18 @@ class TrtllmFmha(Workload):
         """``ref`` as ``get_reference`` returns it, ``impl`` as ``run`` (or
         the reference itself). Every stored output element is compared."""
         m = self.meta
-        if len(ref) != 5 or len(impl) != 5:
-            raise AssertionError("expected (o, o_sf, counters, lse, o float32)")
+        if len(ref) != 6 or len(impl) not in (5, 6):
+            raise AssertionError(
+                "expected (o, o_sf, counters, lse, o float32[, P |V|])"
+            )
+        stats = impl[3]
+        if stats is not None and stats.dim() == 3:
+            # Softmax stats (max, sum) as the kernel writes them; not compared
+            # when the reference has no LSE (sinks).
+            lse = None
+            if ref[3] is not None:
+                lse = LOG2E * stats[..., 0] + torch.log2(stats[..., 1])
+            impl = (*impl[:3], lse, *impl[4:])
         names = ("o", "o_sf", "counter", "lse")
         for name, expected, actual in zip(names, ref[:4], impl[:4]):
             if (expected is None) != (actual is None):
@@ -1664,14 +1712,15 @@ class TrtllmFmha(Workload):
                 raise AssertionError(
                     f"{name}: shape or dtype differs from the reference"
                 )
-        o_ref, sf_ref, counter_ref, lse_ref, exact = ref
-        o, o_sf, counter, lse, _ = impl
+        o_ref, sf_ref, counter_ref, lse_ref, exact, abs_v = ref
+        o, o_sf, counter, lse = impl[:4]
         exact = exact.to(o.device)
+        p_term = p_rounding_bound(abs_v.to(o.device)) if abs_v is not None else 0.0
         if not torch.equal(counter, counter_ref.to(counter.device)):
             raise AssertionError("multi-CTA KV counters were not reset to zero")
         rtol, atol, l2 = self.tolerance()
         if m["dto"] == "e2m1":
-            self._check_nvfp4(o, o_sf, sf_ref, exact, rtol, atol)
+            self._check_nvfp4(o, o_sf, sf_ref, exact, rtol, atol, p_term)
         elif m["dto"] == "e4m3":
             actual = o.view(torch.float8_e4m3fn).float()
             # The kernel's fp32 result is within the kernel tolerance; its
@@ -1679,6 +1728,7 @@ class TrtllmFmha(Workload):
             bound = (
                 atol
                 + rtol * exact.abs()
+                + p_term
                 + 0.5 * e4m3_ulp(torch.maximum(actual.abs(), exact.abs()))
             )
             self._check_elements("FP8 output", actual, exact, bound)
@@ -1686,7 +1736,8 @@ class TrtllmFmha(Workload):
             self._check_l2("FP8 output", actual, exact, l2 + 2.0**-4)
         else:
             actual = o.float()
-            self._check_elements("output", actual, exact, atol + rtol * exact.abs())
+            bound = atol + rtol * exact.abs() + p_term
+            self._check_elements("output", actual, exact, bound)
             self._check_l2("output", actual, exact, l2)
         if lse_ref is not None:
             # Upstream compares the LSE at atol = rtol = 1e-3 (bf16); FP8
@@ -1730,8 +1781,10 @@ class TrtllmFmha(Workload):
         exact: torch.Tensor,
         rtol: float,
         atol: float,
+        p_term: torch.Tensor | float = 0.0,
     ) -> None:
-        """NVFP4 output against the unquantized reference.
+        """NVFP4 output against the unquantized reference (``p_term``: the
+        per-element E4M3 P rounding bound of FP8-query kernels).
 
         Scale factors: the kernel's block scale is E4M3(300 * amax / 6) of its
         own block maximum, which is within the kernel tolerance of the
@@ -1757,8 +1810,13 @@ class TrtllmFmha(Workload):
         if bool((outside != 0).any()):
             raise AssertionError("NVFP4 output: scale factors written outside rows")
         exact = exact.reshape(sum_q, n // 16, 16)
+        if isinstance(p_term, torch.Tensor):
+            p_term = p_term.reshape(sum_q, n // 16, 16)
+            p_block = p_term.amax(-1)
+        else:
+            p_block = p_term
         amax = exact.abs().amax(-1)
-        slack = atol + rtol * amax
+        slack = atol + rtol * amax + p_block
         lo = NVFP4_O_SCALE * (amax - slack).clamp(min=0) / 6.0
         hi = NVFP4_O_SCALE * (amax + slack) / 6.0
         bad = (scales * (1 + 1 / 16) < lo) | (scales * (1 - 1 / 16) > hi)
@@ -1772,7 +1830,7 @@ class TrtllmFmha(Workload):
         unit = (scales / NVFP4_O_SCALE).unsqueeze(-1)
         deq = values.reshape(sum_q, n // 16, 16) * unit
         units = torch.maximum(deq.abs(), exact.abs()) / unit.clamp(min=1e-30)
-        bound = atol + rtol * exact.abs() + e2m1_half_gap(units) * unit
+        bound = atol + rtol * exact.abs() + p_term + e2m1_half_gap(units) * unit
         self._check_elements("NVFP4 output", deq, exact, bound)
 
     def tolerance(self) -> tuple[float, float, float]:
@@ -1785,7 +1843,9 @@ class TrtllmFmha(Workload):
         rounding of P at these logit spreads: <= 1.1e-2 when the kernel
         normalizes by the quantized sum, <= 2.6e-2 by the exact one). NVFP4 KV
         dequantizes in-kernel to E4M3: 6e-2 / 8e-2 and 5e-2. FP8 and NVFP4
-        output rounding is bounded separately in ``validate``.
+        output rounding, and (FP8 queries) the E4M3 rounding of P at rows a
+        few keys dominate (``p_rounding_bound``), are bounded separately in
+        ``validate``.
         """
         m = self.meta
         if m["dtkv"] == "e2m1":
