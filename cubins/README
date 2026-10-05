@@ -1,0 +1,13 @@
+flashinfer-cubins
+
+unmodified: 9,430 cubins, 1,035 MiB.
+
+Uniform workload harness: see HARNESS.md for the Python API, native ABI,
+standalone implementation packages, source regeneration and testing commands.
+Deferred native pipelines are listed in missing_workloads.md.
+
+    fmha/          7,634   trtllm-gen attention: 7,392 sm_100 and
+                           242 sm_100a
+    batched_gemm/  1,405   trtllm-gen batched GEMM
+    deep_gemm/       317   DeepGEMM FP8, m-grouped
+    gemm/             74   trtllm-gen dense GEMM
